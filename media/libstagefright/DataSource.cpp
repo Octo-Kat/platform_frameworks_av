@@ -255,20 +255,6 @@ void Sniffer::registerSnifferPlugin() {
 }
 
 // static
-void DataSource::RegisterSnifferPlugin() {
-    static void (*getExtractorPlugin)(MediaExtractor::Plugin *) =
-            (void (*)(MediaExtractor::Plugin *))loadExtractorPlugin();
-
-    MediaExtractor::Plugin *plugin = MediaExtractor::getPlugin();
-    if (!plugin->sniff && getExtractorPlugin) {
-        getExtractorPlugin(plugin);
-    }
-    if (plugin->sniff) {
-        RegisterSniffer_l(plugin->sniff);
-    }
-}
-
-// static
 sp<DataSource> DataSource::CreateFromURI(
         const char *uri, const KeyedVector<String8, String8> *headers) {
     bool isWidevine = !strncasecmp("widevine://", uri, 11);
