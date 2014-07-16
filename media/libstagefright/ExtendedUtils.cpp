@@ -41,11 +41,15 @@
 #include <media/stagefright/OMXCodec.h>
 #include <cutils/properties.h>
 #include <media/stagefright/MediaExtractor.h>
+#include <media/MediaProfiles.h>
 
 #include "include/ExtendedUtils.h"
 
 static const int64_t kDefaultAVSyncLateMargin =  40000;
 static const int64_t kMaxAVSyncLateMargin     = 250000;
+
+static const unsigned kDefaultRtpPortRangeStart = 15550;
+static const unsigned kDefaultRtpPortRangeEnd = 65535;
 
 #ifdef ENABLE_AV_ENHANCEMENTS
 
@@ -58,6 +62,8 @@ static const int64_t kMaxAVSyncLateMargin     = 250000;
 #include <linux/msm_ion.h>
 #define MEM_DEVICE "/dev/ion"
 #define MEM_HEAP_ID ION_CP_MM_HEAP_ID
+
+#include <media/stagefright/foundation/ALooper.h>
 
 namespace android {
 
@@ -101,7 +107,6 @@ status_t ExtendedUtils::HFR::initializeHFR(
 #endif
 
     int32_t hfr = 0;
-
     if (!meta->findInt32(kKeyHFR, &hfr)) {
         ALOGW("hfr not found, default to 0");
     }
@@ -113,30 +118,21 @@ status_t ExtendedUtils::HFR::initializeHFR(
     }
 
     int32_t width = 0, height = 0;
-
     CHECK(meta->findInt32(kKeyWidth, &width));
     CHECK(meta->findInt32(kKeyHeight, &height));
 
-    char mDeviceName[PROPERTY_VALUE_MAX];
-    property_get("ro.board.platform",mDeviceName,"0");
-    if (!strncmp(mDeviceName, "msm8974", 7) ||
-        !strncmp(mDeviceName, "apq8064", 7) ||
-        !strncmp(mDeviceName, "apq8084", 7)) {
-        if ((width * height * hfr > 1920*1088*120)) {
-            ALOGE("HFR mode is supported only upto 1080p resolution");
-            return INVALID_OPERATION;
-        }
-    } else if (!strncmp(mDeviceName, "msm8610", 7)) {
-        if ((width * height * hfr > 320*240*120)) {
-            ALOGE("HFR mode is supported only upto QVGA resolution");
-            return INVALID_OPERATION;
-        }
-    } else { // includes msm8226
-        if (((videoEncoder != VIDEO_ENCODER_H264)
-                || (width * height * hfr > 800*480*120))) {
-            ALOGE("HFR mode is supported only upto WVGA and H264 codec.");
-            return INVALID_OPERATION;
-        }
+    int maxW, maxH, MaxFrameRate, maxBitRate = 0;
+    if (getHFRCapabilities(videoEncoder,
+            maxW, maxH, MaxFrameRate, maxBitRate) < 0) {
+        ALOGE("Failed to query HFR target capabilities");
+        return ERROR_UNSUPPORTED;
+    }
+
+    if ((width * height * hfr) > (maxW * maxH * MaxFrameRate)) {
+        ALOGE("HFR request [%d x %d @%d fps] exceeds "
+                "[%d x %d @%d fps]",
+                width, height, hfr, maxW, maxH, MaxFrameRate);
+        return ERROR_UNSUPPORTED;
     }
 
     int32_t frameRate = 0, bitRate = 0;
@@ -144,11 +140,18 @@ status_t ExtendedUtils::HFR::initializeHFR(
     CHECK(enc_meta->findInt32(kKeyBitRate, &bitRate));
 
     if (frameRate) {
+        // scale the bitrate proportional to the hfr ratio
+        // to maintain quality, but cap it to max-supported.
         bitRate = (hfr * bitRate) / frameRate;
-        int32_t hfrRatio = hfr/frameRate;
+        bitRate = bitRate > maxBitRate ? maxBitRate : bitRate;
         enc_meta->setInt32(kKeyBitRate, bitRate);
+
+        int32_t hfrRatio = hfr / frameRate;
         enc_meta->setInt32(kKeyFrameRate, hfr);
         enc_meta->setInt32(kKeyHFR, hfrRatio);
+    } else {
+        ALOGE("HFR: Invalid framerate");
+        return BAD_VALUE;
     }
 
     return retVal;
@@ -169,6 +172,22 @@ int32_t ExtendedUtils::HFR::getHFRRatio(
     int32_t hfr = 0;
     meta->findInt32(kKeyHFR, &hfr);
     return hfr ? hfr : 1;
+}
+
+int32_t ExtendedUtils::HFR::getHFRCapabilities(
+        video_encoder codec,
+        int& maxHFRWidth, int& maxHFRHeight, int& maxHFRFps,
+        int& maxBitRate) {
+    maxHFRWidth = maxHFRHeight = maxHFRFps = maxBitRate = 0;
+    MediaProfiles *profiles = MediaProfiles::getInstance();
+    if (profiles) {
+        maxHFRWidth = profiles->getVideoEncoderParamByName("enc.vid.hfr.width.max", codec);
+        maxHFRHeight = profiles->getVideoEncoderParamByName("enc.vid.hfr.height.max", codec);
+        maxHFRFps = profiles->getVideoEncoderParamByName("enc.vid.hfr.mode.max", codec);
+        maxBitRate = profiles->getVideoEncoderParamByName("enc.vid.bps.max", codec);
+    }
+    return (maxHFRWidth > 0) && (maxHFRHeight > 0) &&
+            (maxHFRFps > 0) && (maxBitRate > 0) ? 1 : -1;
 }
 
 bool ExtendedUtils::ShellProp::isAudioDisabled(bool isEncoder) {
@@ -242,6 +261,24 @@ int64_t ExtendedUtils::ShellProp::getMaxAVSyncLateMargin() {
 bool ExtendedUtils::ShellProp::isSmoothStreamingEnabled() {
     char prop[PROPERTY_VALUE_MAX] = {0};
     property_get("mm.enable.smoothstreaming", prop, "0");
+    if (!strncmp(prop, "true", 4) || atoi(prop)) {
+        return true;
+    }
+    return false;
+}
+
+bool ExtendedUtils::ShellProp::isCustomAVSyncEnabled() {
+    char prop[PROPERTY_VALUE_MAX] = {0};
+    property_get("mm.enable.customavsync", prop, "0");
+    if (!strncmp(prop, "true", 4) || atoi(prop)) {
+        return true;
+    }
+    return false;
+}
+
+bool ExtendedUtils::ShellProp::isMpeg4DPSupportedByHardware() {
+    char prop[PROPERTY_VALUE_MAX] = {0};
+    property_get("mm.mpeg4dp.hw.support", prop, "0");
     if (!strncmp(prop, "true", 4) || atoi(prop)) {
         return true;
     }
@@ -482,10 +519,10 @@ void ExtendedUtils::helper_addMediaCodec(Vector<MediaCodecList::CodecInfo> &mCod
     info->mIsEncoder = encoder;
     info->mTypes=0;
     ssize_t index = mTypes.indexOfKey(type);
-    uint32_t bit;
+    uint64_t bit;
     if(index < 0) {
          bit = mTypes.size();
-         if (bit == 32) {
+         if (bit == 64) {
              ALOGW("Too many distinct type names in configuration.");
              return;
          }
@@ -662,6 +699,154 @@ void ExtendedUtils::drainSecurePool()
 #endif
 }
 
+VSyncLocker::VSyncLocker()
+    : mExitVsyncEvent(true),
+      mLooper(NULL),
+      mSyncState(PROFILE_FPS),
+      mStartTime(-1),
+      mProfileCount(0) {
+}
+
+VSyncLocker::~VSyncLocker() {
+    if(!mExitVsyncEvent) {
+        mExitVsyncEvent = true;
+        void *dummy;
+        pthread_join(mThread, &dummy);
+    }
+}
+
+bool VSyncLocker::isSyncRenderEnabled() {
+    char value[PROPERTY_VALUE_MAX];
+    bool ret = true;
+    property_get("mm.enable.vsync.render", value, "0");
+    if (atoi(value) == 0) {
+        ret = false;
+    }
+    return ret;
+}
+
+void VSyncLocker::updateSyncState() {
+    if (mSyncState == PROFILE_FPS) {
+        mProfileCount++;
+        if (mProfileCount == 1) {
+            mStartTime = ALooper::GetNowUs();
+        } else if (mProfileCount == kMaxProfileCount) {
+            int fps = (kMaxProfileCount * 1000000) /
+                      (ALooper::GetNowUs() - mStartTime);
+            if (fps > 35) {
+                ALOGI("Synchronized rendering blocked at %d fps", fps);
+                mSyncState = BLOCK_SYNC;
+                mExitVsyncEvent = true;
+            } else {
+                ALOGI("Synchronized rendering enabled at %d fps", fps);
+                mSyncState = ENABLE_SYNC;
+            }
+        }
+    }
+}
+
+void VSyncLocker::waitOnVSync() {
+    Mutex::Autolock autoLock(mVsyncLock);
+    mVSyncCondition.wait(mVsyncLock);
+}
+
+void VSyncLocker::resetProfile() {
+    if (mSyncState == PROFILE_FPS) {
+        mProfileCount = 0;
+    }
+}
+
+void VSyncLocker::blockSync() {
+    if (mSyncState == ENABLE_SYNC) {
+        ALOGI("Synchronized rendering blocked");
+        mSyncState = BLOCK_SYNC;
+        mExitVsyncEvent = true;
+    }
+}
+
+void VSyncLocker::blockOnVSync() {
+        if (mSyncState == PROFILE_FPS) {
+            updateSyncState();
+        } else if(mSyncState == ENABLE_SYNC) {
+            waitOnVSync();
+        }
+}
+
+void VSyncLocker::start() {
+    mExitVsyncEvent = false;
+    mLooper = new Looper(false);
+    mLooper->addFd(mDisplayEventReceiver.getFd(), 0,
+                   ALOOPER_EVENT_INPUT, receiver, (void *)this);
+    mDisplayEventReceiver.setVsyncRate(1);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+    pthread_create(&mThread, &attr, ThreadWrapper, (void *)this);
+    pthread_attr_destroy(&attr);
+}
+
+void VSyncLocker::VSyncEvent() {
+    do {
+        int ret = 0;
+        if (mLooper != NULL) {
+            ret = mLooper->pollOnce(-1);
+        }
+    } while (!mExitVsyncEvent);
+    mDisplayEventReceiver.setVsyncRate(0);
+    mLooper->removeFd(mDisplayEventReceiver.getFd());
+}
+
+void VSyncLocker::signalVSync() {
+   DisplayEventReceiver::Event buffer[1];
+   if(mDisplayEventReceiver.getEvents(buffer, 1)) {
+       if (buffer[0].header.type != DisplayEventReceiver::DISPLAY_EVENT_VSYNC) {
+           return;
+        }
+   }
+   mVsyncLock.lock();
+   mVSyncCondition.signal();
+   mVsyncLock.unlock();
+   ALOGV("Signalling VSync");
+}
+
+void *VSyncLocker::ThreadWrapper(void *context) {
+    VSyncLocker *renderer = (VSyncLocker *)context;
+    renderer->VSyncEvent();
+    return NULL;
+}
+
+int VSyncLocker::receiver(int fd, int events, void *context) {
+    VSyncLocker *locker = (VSyncLocker *)context;
+    locker->signalVSync();
+    return 1;
+}
+
+void ExtendedUtils::parseRtpPortRangeFromSystemProperty(unsigned *start, unsigned *end) {
+    char value[PROPERTY_VALUE_MAX];
+    if (!property_get("persist.sys.media.rtp-ports", value, NULL)) {
+        ALOGV("Cannot get property of persist.sys.media.rtp-ports");
+        *start = kDefaultRtpPortRangeStart;
+        *end = kDefaultRtpPortRangeEnd;
+        return;
+    }
+
+    if (sscanf(value, "%u/%u", start, end) != 2) {
+        ALOGE("Failed to parse rtp port range from '%s'.", value);
+        *start = kDefaultRtpPortRangeStart;
+        *end = kDefaultRtpPortRangeEnd;
+        return;
+    }
+
+    if (*start > *end || *start <= 1024 || *end >= 65535) {
+        ALOGE("Illegal rtp port start/end specified, reverting to defaults.");
+        *start = kDefaultRtpPortRangeStart;
+        *end = kDefaultRtpPortRangeEnd;
+        return;
+    }
+
+    ALOGV("rtp port_start = %u, port_end = %u", *start, *end);
+}
+
 }
 #else //ENABLE_AV_ENHANCEMENTS
 
@@ -684,7 +869,15 @@ void ExtendedUtils::HFR::copyHFRParams(
 
 int32_t ExtendedUtils::HFR::getHFRRatio(
         const sp<MetaData> &meta) {
-        return 0;
+    return 1;
+}
+
+int32_t ExtendedUtils::HFR::getHFRCapabilities(
+        video_encoder codec,
+        int& maxHFRWidth, int& maxHFRHeight, int& maxHFRFps,
+        int& maxBitRate) {
+    maxHFRWidth = maxHFRHeight = maxHFRFps = maxBitRate = 0;
+    return -1;
 }
 
 bool ExtendedUtils::ShellProp::isAudioDisabled(bool isEncoder) {
@@ -700,6 +893,14 @@ int64_t ExtendedUtils::ShellProp::getMaxAVSyncLateMargin() {
 }
 
 bool ExtendedUtils::ShellProp::isSmoothStreamingEnabled() {
+    return false;
+}
+
+bool ExtendedUtils::ShellProp::isCustomAVSyncEnabled() {
+    return false;
+}
+
+bool ExtendedUtils::ShellProp::isMpeg4DPSupportedByHardware() {
     return false;
 }
 
@@ -766,6 +967,43 @@ void ExtendedUtils::prefetchSecurePool() {}
 void ExtendedUtils::createSecurePool() {}
 
 void ExtendedUtils::drainSecurePool() {}
+
+VSyncLocker::VSyncLocker() {}
+
+VSyncLocker::~VSyncLocker() {}
+
+bool VSyncLocker::isSyncRenderEnabled() {
+    return false;
+}
+
+void *VSyncLocker::ThreadWrapper(void *context) {
+    return NULL;
+}
+
+int VSyncLocker::receiver(int fd, int events, void *context) {
+    return 0;
+}
+
+void VSyncLocker::updateSyncState() {}
+
+void VSyncLocker::waitOnVSync() {}
+
+void VSyncLocker::resetProfile() {}
+
+void VSyncLocker::blockSync() {}
+
+void VSyncLocker::blockOnVSync() {}
+
+void VSyncLocker::start() {}
+
+void VSyncLocker::VSyncEvent() {}
+
+void VSyncLocker::signalVSync() {}
+
+void ExtendedUtils::parseRtpPortRangeFromSystemProperty(unsigned *start, unsigned *end) {
+    *start = kDefaultRtpPortRangeStart;
+    *end = kDefaultRtpPortRangeEnd;
+}
 
 }
 #endif //ENABLE_AV_ENHANCEMENTS
